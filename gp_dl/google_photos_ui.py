@@ -454,13 +454,29 @@ def _start_download_with_keyboard_shortcut(driver) -> bool:
             body.click()
         except Exception:
             pass
+
         ActionChains(driver).move_to_element(body).click(body).key_down(
             Keys.SHIFT
         ).send_keys("d").key_up(Keys.SHIFT).perform()
         return True
-    except Exception as e:
-        logging.debug(f"Keyboard download shortcut failed: {e}")
-        return False
+    except Exception as first_error:
+        logging.debug(f"Primary keyboard shortcut attempt failed: {first_error}")
+
+    try:
+        active = driver.execute_script("return document.activeElement")
+        if active is not None:
+            try:
+                active.click()
+            except Exception:
+                pass
+            active.send_keys(Keys.SHIFT, "d")
+            return True
+    except Exception as second_error:
+        logging.debug(
+            f"Active-element keyboard shortcut attempt failed: {second_error}"
+        )
+
+    return False
 
 
 def _wait_for_download_start(

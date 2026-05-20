@@ -1,8 +1,10 @@
+import json
 import logging
 import os
 import re
 import shutil
 import time
+from datetime import datetime
 from pathlib import Path
 
 from .browser import find_completed_download_file
@@ -166,6 +168,151 @@ def _record_google_id_for_existing_path(
         target_album_dir,
     )
     _record_google_id_file(album_dir, google_id, file_path, output_path)
+
+
+def _prepare_download_focus(driver, google_id: str) -> None:
+    try:
+        body = driver.execute_script("return document.body")
+        if body is not None:
+            try:
+                body.click()
+            except Exception:
+                pass
+        _ = driver.execute_script(
+            """
+            try {
+              const media = document.querySelector('video, img');
+              if (media && media.focus) media.focus();
+              if (media && media.click) media.click();
+              if (document.body && document.body.focus) document.body.focus();
+            } catch (e) {}
+            return true;
+            """
+        )
+    except Exception as e:
+        logging.debug(
+            f"Could not prepare focus for Google Photos item {google_id}: {e}"
+        )
+
+
+def _capture_download_failure_artifacts(
+    driver,
+    output_path: Path,
+    album_title: str,
+    google_id: str,
+    reason: str,
+    item_url: str,
+    temp_dir_path: Path,
+) -> None:
+    try:
+        safe_album = re.sub(r"[^A-Za-z0-9._-]+", "_", album_title) or "album"
+        safe_id = re.sub(r"[^A-Za-z0-9._-]+", "_", google_id) or "item"
+        ts = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
+        artifact_dir = (
+            output_path / ".gp-dl-failures" / safe_album / f"{ts}_{safe_id}"
+        ).resolve()
+        artifact_dir.mkdir(parents=True, exist_ok=True)
+
+        screenshot_path = artifact_dir / "screenshot.png"
+        html_path = artifact_dir / "page.html"
+        meta_path = artifact_dir / "meta.json"
+        browser_log_path = artifact_dir / "browser.log"
+        performance_log_path = artifact_dir / "performance.log"
+        download_dir_snapshot_path = artifact_dir / "download_dir_snapshot.txt"
+
+        try:
+            driver.save_screenshot(str(screenshot_path))
+        except Exception as e:
+            logging.debug(f"Could not capture screenshot for {google_id}: {e}")
+
+        try:
+            html_path.write_text(driver.page_source or "", encoding="utf-8")
+        except Exception as e:
+            logging.debug(f"Could not capture page source for {google_id}: {e}")
+
+        meta = {
+            "google_id": google_id,
+            "album": album_title,
+            "reason": reason,
+            "requested_item_url": item_url,
+            "current_url": None,
+            "title": None,
+            "active_element": None,
+            "has_focus": None,
+            "timestamp_utc": ts,
+            "temp_dir": str(temp_dir_path),
+        }
+
+        try:
+            meta["current_url"] = driver.current_url
+        except Exception:
+            pass
+        try:
+            meta["title"] = driver.title
+        except Exception:
+            pass
+        try:
+            active = driver.execute_script(
+                """
+                const el = document.activeElement;
+                if (!el) return null;
+                return {
+                  tag: el.tagName,
+                  id: el.id || null,
+                  className: el.className || null,
+                  ariaLabel: el.getAttribute ? el.getAttribute('aria-label') : null
+                };
+                """
+            )
+            meta["active_element"] = active
+        except Exception:
+            pass
+        try:
+            meta["has_focus"] = driver.execute_script("return document.hasFocus();")
+        except Exception:
+            pass
+
+        try:
+            meta_path.write_text(json.dumps(meta, indent=2), encoding="utf-8")
+        except Exception as e:
+            logging.debug(f"Could not write meta.json for {google_id}: {e}")
+
+        try:
+            browser_entries = driver.get_log("browser")
+            browser_log_path.write_text(
+                "\n".join(json.dumps(entry) for entry in browser_entries),
+                encoding="utf-8",
+            )
+        except Exception as e:
+            logging.debug(f"Could not capture browser console log for {google_id}: {e}")
+
+        try:
+            perf_entries = driver.get_log("performance")
+            performance_log_path.write_text(
+                "\n".join(json.dumps(entry) for entry in perf_entries),
+                encoding="utf-8",
+            )
+        except Exception as e:
+            logging.debug(f"Could not capture performance log for {google_id}: {e}")
+
+        try:
+            if temp_dir_path.exists() and temp_dir_path.is_dir():
+                names = sorted(path.name for path in temp_dir_path.iterdir())
+                download_dir_snapshot_path.write_text(
+                    "\n".join(names), encoding="utf-8"
+                )
+            else:
+                download_dir_snapshot_path.write_text(
+                    "<missing download directory>", encoding="utf-8"
+                )
+        except Exception as e:
+            logging.debug(f"Could not snapshot download directory for {google_id}: {e}")
+
+        logging.error(
+            f"Captured failure artifacts for Google Photos item {google_id} at {artifact_dir}"
+        )
+    except Exception as e:
+        logging.debug(f"Could not capture failure artifacts for {google_id}: {e}")
 
 
 def _rewrite_full_album_manifest(output_path: Path, album_title: str) -> None:
@@ -478,6 +625,7 @@ def _download_individual_album_items(
 
         logging.info(f"Downloading missing Google Photos item {google_id}")
         driver.get(item["url"])
+        _prepare_download_focus(driver, google_id)
 
         download_started = False
         for attempt in range(1, 4):
@@ -498,6 +646,15 @@ def _download_individual_album_items(
             logging.error(
                 f"Could not start individual download for Google Photos item {google_id} using keyboard shortcut (Shift+D)."
             )
+            _capture_download_failure_artifacts(
+                driver,
+                output_path,
+                album_title,
+                google_id,
+                "download_not_started_shift_d",
+                item.get("url", ""),
+                temp_dir_path,
+            )
             failed_count += 1
             continue
 
@@ -512,6 +669,15 @@ def _download_individual_album_items(
         if not downloaded_file:
             logging.error(
                 f"Timed out waiting for individual download for Google Photos item {google_id}"
+            )
+            _capture_download_failure_artifacts(
+                driver,
+                output_path,
+                album_title,
+                google_id,
+                "download_timeout_after_start",
+                item.get("url", ""),
+                temp_dir_path,
             )
             failed_count += 1
             continue
