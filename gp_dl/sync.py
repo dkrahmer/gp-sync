@@ -1096,12 +1096,65 @@ def _download_individual_album_items(
                 continue
 
             if downloaded_path.suffix.casefold() in {".zip", ".html", ".htm"}:
-                logging.error(
-                    f"Refusing unsupported download format for Google Photos item {google_id}."
+                logging.warning(
+                    f"Detected unsupported download format for Google Photos item {google_id}; retrying."
                 )
-                failed_count += 1
                 _best_effort_unlink(downloaded_path, "downloaded file")
-                continue
+
+                unsupported_format_retry_succeeded = False
+                for format_retry_attempt in range(1, 3):
+                    logging.info(
+                        f"Retrying download for Google Photos item {google_id} after unsupported format (attempt {format_retry_attempt}/2)."
+                    )
+                    driver.get(item["url"])
+                    _prepare_download_focus(driver, google_id)
+                    time.sleep(0.5)
+
+                    # Reset download tracking for this retry
+                    existing_download_files = (
+                        set(temp_dir_path.iterdir()) if temp_dir_path.is_dir() else set()
+                    )
+                    existing_download_names_retry = {p.name for p in existing_download_files}
+                    existing_download_snapshot_retry = _snapshot_completed_files(temp_dir_path)
+
+                    retry_download_file = None
+                    triggered = _start_download_with_keyboard_shortcut(driver)
+                    if triggered and _wait_for_download_start(
+                        temp_dir_path,
+                        existing_download_names_retry,
+                        timeout=max(6.0, float(WEB_DRIVER_WAIT)),
+                    ):
+                        deadline = time.perf_counter() + max(WEB_DRIVER_WAIT, 10) * 12
+                        while time.perf_counter() < deadline and not retry_download_file:
+                            retry_download_file = _find_completed_download_with_overwrite_detection(
+                                temp_dir_path,
+                                existing_download_names_retry,
+                                existing_download_snapshot_retry,
+                            )
+                            time.sleep(0.1)
+
+                    if retry_download_file:
+                        retry_download_path = temp_dir_path / retry_download_file
+                        if retry_download_path.suffix.casefold() not in {".zip", ".html", ".htm"}:
+                            logging.info(
+                                f"Retry succeeded for Google Photos item {google_id}; file has valid format."
+                            )
+                            downloaded_file = retry_download_file
+                            downloaded_path = retry_download_path
+                            unsupported_format_retry_succeeded = True
+                            break
+                        else:
+                            logging.debug(
+                                f"Retry attempt {format_retry_attempt}/2 still has unsupported format for Google Photos item {google_id}."
+                            )
+                            _best_effort_unlink(retry_download_path, "downloaded file")
+
+                if not unsupported_format_retry_succeeded:
+                    logging.error(
+                        f"Refusing unsupported download format for Google Photos item {google_id} after retry."
+                    )
+                    failed_count += 1
+                    continue
 
             if _path_conflicts_case_insensitive(resolved_target):
                 conflicting_path = _find_conflicting_file_case_insensitive(

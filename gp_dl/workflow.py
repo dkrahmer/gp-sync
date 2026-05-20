@@ -143,12 +143,12 @@ def download_albums(
     temp_dir = temp_dir or output_dir
     temp_dir_path = Path(temp_dir).resolve()
     output_path = Path(output_dir).resolve()
-    
+
     # Create dedicated downloads subdirectory
     downloads_dir = temp_dir_path / ".downloads"
     downloads_dir.mkdir(parents=True, exist_ok=True)
     logging.info(f"Using downloads subdirectory: {downloads_dir}")
-    
+
     driver = get_driver(
         driver_path=driver_path,
         profile_dir=profile_dir,
