@@ -11,7 +11,7 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import unquote, urlparse
 from urllib.request import Request, urlopen
 
-from .browser import find_completed_download_file
+from .browser import find_completed_download_file, restart_driver
 from .config import WEB_DRIVER_WAIT
 from .google_photos_ui import (
     _collect_album_photo_items,
@@ -1358,6 +1358,15 @@ def _download_individual_album_items(
                 logging.info(f"Saved individual download as {final_name}")
             downloaded_count += 1
         except Exception as e:
+            if "tab crashed" in str(e).lower():
+                logging.warning(
+                    f"Chrome tab crashed for Google Photos item {google_id}; restarting browser..."
+                )
+                try:
+                    driver = restart_driver()
+                    logging.info("Browser restarted successfully after tab crash.")
+                except Exception as restart_err:
+                    logging.error(f"Failed to restart browser after tab crash: {restart_err}")
             logging.error(
                 f"Individual sync failed for Google Photos item {google_id}; continuing with next item. Error: {e}"
             )
@@ -1618,10 +1627,18 @@ def _download_missing_album_items_by_google_id(
             deleted_count,
         )
 
+    total_chunks = (len(missing_items) + ALBUM_SYNC_CHUNK_SIZE - 1) // ALBUM_SYNC_CHUNK_SIZE
     for start in range(0, len(missing_items), ALBUM_SYNC_CHUNK_SIZE):
         chunk = missing_items[start : start + ALBUM_SYNC_CHUNK_SIZE]
         chunk_number = (start // ALBUM_SYNC_CHUNK_SIZE) + 1
-        total_chunks = (len(missing_items) + ALBUM_SYNC_CHUNK_SIZE - 1) // ALBUM_SYNC_CHUNK_SIZE
+        if chunk_number > 1 or total_chunks > 1:
+            logging.info(
+                f"Restarting browser before chunk {chunk_number}/{total_chunks} for [{album_title}]."
+            )
+            try:
+                driver = restart_driver()
+            except Exception as restart_err:
+                logging.error(f"Failed to restart browser before chunk {chunk_number}: {restart_err}")
         logging.info(
             f"Processing album download chunk {chunk_number}/{total_chunks} for [{album_title}] with {len(chunk)} item(s)."
         )

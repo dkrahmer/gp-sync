@@ -12,10 +12,11 @@ RUNNING_ON_LINUX = platform.system().lower() == "linux"
 
 __driver__ = None
 __driver_download_dir__ = None
+__driver_params__: dict = {}
 
 
 def get_driver(driver_path=None, profile_dir=None, headless=True, temp_dir=None):
-    global __driver__, __driver_download_dir__
+    global __driver__, __driver_download_dir__, __driver_params__
     requested_download_dir = temp_dir or os.path.join(os.getcwd(), "gp_temp")
     if __driver__ is None or __driver_download_dir__ != requested_download_dir:
         if __driver__ is not None:
@@ -30,6 +31,11 @@ def get_driver(driver_path=None, profile_dir=None, headless=True, temp_dir=None)
             driver_path, profile_dir, headless, requested_download_dir
         )
         __driver_download_dir__ = requested_download_dir
+        __driver_params__ = {
+            "driver_path": driver_path,
+            "profile_dir": profile_dir,
+            "headless": headless,
+        }
     return __driver__
 
 
@@ -37,6 +43,20 @@ def reset_driver():
     global __driver__, __driver_download_dir__
     __driver__ = None
     __driver_download_dir__ = None
+
+
+def restart_driver():
+    """Quit the current driver (if any) and start a fresh one with the same parameters."""
+    global __driver__, __driver_download_dir__, __driver_params__
+    if __driver__ is not None:
+        try:
+            __driver__.quit()
+        except Exception:
+            pass
+        __driver__ = None
+    params = dict(__driver_params__)
+    params["temp_dir"] = __driver_download_dir__
+    return get_driver(**params)
 
 
 def _apply_download_behavior(driver, download_dir: str) -> None:

@@ -180,3 +180,5 @@ logs/
 logs
 settings.json
 data.json
+.vs/
+test1/
