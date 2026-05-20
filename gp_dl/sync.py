@@ -935,13 +935,16 @@ def _download_individual_album_items(
                     logging.info(
                         f"Motion photo controls detected for Google Photos item {google_id}; using direct save fallback for this session."
                     )
+                    # In direct-save-only mode we are not recovering from a just-failed
+                    # Shift+D on the same page, so prefer a fresh per-item URL lookup to
+                    # avoid reusing a stale image element from the previous item.
                     downloaded_file = _download_motion_photo_still(
                         driver,
                         temp_dir_path,
                         google_id,
                         item_url=item["url"],
                         timeout=3.0,
-                        image_url=motion_photo_still_url,
+                        image_url=None,
                         referer_url=item["url"],
                     )
                     if not downloaded_file:

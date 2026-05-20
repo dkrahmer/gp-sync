@@ -538,10 +538,34 @@ def _photo_image_download_url(driver, timeout: float | None = None) -> str | Non
         try:
             src = driver.execute_script(
                 """
+                function isVisible(img) {
+                    if (!img) return false;
+                    const rect = img.getBoundingClientRect();
+                    if (rect.width <= 1 || rect.height <= 1) return false;
+                    const style = window.getComputedStyle(img);
+                    if (!style || style.display === 'none' || style.visibility === 'hidden') return false;
+                    if (Number(style.opacity || '1') === 0) return false;
+                    return true;
+                }
+
+                const viewportWidth = window.innerWidth || document.documentElement.clientWidth || 0;
+                const viewportHeight = window.innerHeight || document.documentElement.clientHeight || 0;
+
                 const images = Array.from(document.querySelectorAll('img'))
-                    .filter((img) => img.naturalWidth > 200 && img.naturalHeight > 200)
-                    .sort((a, b) => (b.naturalWidth * b.naturalHeight) - (a.naturalWidth * a.naturalHeight));
-                return images[0] ? (images[0].currentSrc || images[0].src || images[0].getAttribute('src')) : null;
+                    .filter((img) => img.naturalWidth > 200 && img.naturalHeight > 200 && isVisible(img))
+                    .map((img) => {
+                        const rect = img.getBoundingClientRect();
+                        const inViewport = rect.bottom > 0 && rect.right > 0 && rect.top < viewportHeight && rect.left < viewportWidth;
+                        const area = rect.width * rect.height;
+                        const naturalArea = img.naturalWidth * img.naturalHeight;
+                        // Prefer currently visible/in-viewport content over hidden stale images.
+                        const score = (inViewport ? 10_000_000_000 : 0) + (area * 1000) + naturalArea;
+                        return { img, score };
+                    })
+                    .sort((a, b) => b.score - a.score);
+
+                const selected = images[0] ? images[0].img : null;
+                return selected ? (selected.currentSrc || selected.src || selected.getAttribute('src')) : null;
                 """
             )
         except Exception as e:
