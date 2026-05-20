@@ -209,7 +209,8 @@ def _prepare_download_focus(driver, google_id: str) -> None:
         body = driver.execute_script("return document.body")
         if body is not None:
             try:
-                body.click()
+                if body.focus:
+                    body.focus()
             except Exception:
                 pass
         _ = driver.execute_script(
@@ -217,8 +218,6 @@ def _prepare_download_focus(driver, google_id: str) -> None:
             try {
               const media = document.querySelector('video, img');
               if (media && media.focus) media.focus();
-              if (media && media.click) media.click();
-              if (document.body && document.body.focus) document.body.focus();
             } catch (e) {}
             return true;
             """
