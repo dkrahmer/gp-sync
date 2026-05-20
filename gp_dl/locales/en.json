@@ -1,6 +1,7 @@
 {
-    "share": "Share",
-    "albums": "Albums",
-    "download": "Download all",
-    "options": "More options"
+	"share": "Share",
+	"albums": "Albums",
+	"download": "Download all",
+	"download_selected": "Download",
+	"options": "More options"
 }

@@ -1,11 +1,11 @@
 [project]
 name = "gp-dl"
-version = "0.4.0"
-description = "A Python-based Google Photos downloader built with Selenium."
+version = "0.5.0"
+description = "A Python-based Google Photos sync downloader built with Selenium."
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "GPL v3" }
-authors = [{ name = "csd4ni3l", email = "csd4ni3l@duck.com" }]
+authors = [{ name = "dkrahmer", email = "doug.gp-dl@remhark.com" }, { name = "csd4ni3l", email = "csd4ni3l@duck.com" }]
 dependencies = ["selenium>=4.33.0"]
 classifiers = [
     "License :: OSI Approved :: GNU General Public License v3 (GPLv3)",

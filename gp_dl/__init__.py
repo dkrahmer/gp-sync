@@ -1,3 +1,4 @@
-from .lib import download_albums
+from .workflow import download_albums
 
-__version__ = "0.4.0"
+__all__ = ["download_albums"]
+__version__ = "0.5.0"
