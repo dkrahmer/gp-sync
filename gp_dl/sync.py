@@ -37,6 +37,7 @@ from .parsing import (
     _download_response_filename,
     _extract_google_id_from_filename,
     _extract_media_filenames,
+    _item_looks_like_video,
     _normalize_filename,
 )
 
@@ -835,10 +836,45 @@ def _download_individual_album_items(
                 skipped_count += 1
                 continue
 
+            candidate_filenames = _extract_media_filenames(
+                str(item.get("identifiers", "") or "")
+            )
+            if candidate_filenames:
+                matched_existing = None
+                for filename in sorted(candidate_filenames):
+                    normalized = _normalized_match_filename(filename)
+                    candidate_paths = sorted(
+                        files_by_name.get(normalized, []), key=_path_match_priority
+                    )
+                    for path in candidate_paths:
+                        resolved = path.resolve()
+                        if not resolved.exists() or not resolved.is_file():
+                            continue
+                        if (
+                            trusted_existing_paths is not None
+                            and resolved not in trusted_existing_paths
+                        ):
+                            continue
+                        matched_existing = resolved
+                        break
+                    if matched_existing is not None:
+                        break
+
+                if matched_existing is not None:
+                    _record_google_id_for_existing_path(
+                        album_dirs,
+                        google_id,
+                        matched_existing,
+                        target_album_dir,
+                        output_path,
+                    )
+                    logging.info(
+                        f"Matched existing file before download for Google Photos item {google_id}: {matched_existing}. Added mapping to {GOOGLE_ID_MANIFEST_FILENAME}."
+                    )
+                    skipped_count += 1
+                    continue
+
             if bootstrap_from_filename:
-                candidate_filenames = _extract_media_filenames(
-                    str(item.get("identifiers", "") or "")
-                )
                 assigned_paths = {
                     path.resolve()
                     for existing_paths in files_by_google_id.values()
@@ -890,7 +926,9 @@ def _download_individual_album_items(
 
             downloaded_file = None
             motion_photo_still_url = None
-            motion_photo_page = _is_motion_photo_page(driver, timeout=0.5)
+            motion_photo_page = not _item_looks_like_video(item) and _is_motion_photo_page(
+                driver, timeout=0.5
+            )
             if motion_photo_page:
                 motion_photo_still_url = _photo_image_download_url(driver, timeout=3.0)
                 if MOTION_PHOTO_DIRECT_SAVE_ONLY:
