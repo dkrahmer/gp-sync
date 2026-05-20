@@ -6,7 +6,7 @@ readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "GPL v3" }
 authors = [{ name = "dkrahmer", email = "doug.gp-sync@remhark.com" }, { name = "csd4ni3l", email = "csd4ni3l@duck.com" }]
-dependencies = ["selenium>=4.33.0"]
+dependencies = ["selenium==4.44.0"]
 classifiers = [
     "License :: OSI Approved :: GNU General Public License v3 (GPLv3)",
     "Programming Language :: Python :: 3",
