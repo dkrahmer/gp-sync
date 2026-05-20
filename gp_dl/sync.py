@@ -42,7 +42,7 @@ from .parsing import (
 )
 
 MOTION_PHOTO_DIRECT_SAVE_ONLY = False
-
+ALBUM_SYNC_CHUNK_SIZE = 100
 
 def _filename_with_google_id_suffix(filename: str, google_id: str) -> str:
     path = Path(filename)
@@ -1445,7 +1445,35 @@ def _download_missing_album_items_by_google_id(
     temp_dir_path: Path,
     propagate_deletes: bool,
 ) -> tuple[bool, int, int, int, int, int]:
-    album_items = _collect_album_photo_items(driver)
+    all_album_items: dict[str, dict[str, str]] = {}
+    total_downloaded = 0
+    total_skipped = 0
+    total_failed = 0
+    deleted_count = 0
+    chunk_index = 0
+
+    while True:
+        chunk_index += 1
+        known_google_ids = {google_id.casefold() for google_id in all_album_items}
+        chunk_items = _collect_album_photo_items(
+            driver,
+            max_items=ALBUM_SYNC_CHUNK_SIZE,
+            exclude_google_ids=known_google_ids,
+        )
+        if not chunk_items:
+            break
+
+        for item in chunk_items:
+            all_album_items[item["google_id"]] = item
+
+        logging.info(
+            f"Collected album item chunk {chunk_index} for [{album_title}]: {len(chunk_items)} new item(s), {len(all_album_items)} total discovered."
+        )
+
+        if len(chunk_items) < ALBUM_SYNC_CHUNK_SIZE:
+            break
+
+    album_items = list(all_album_items.values())
     if not album_items:
         logging.info(
             "Could not collect individual Google Photos item links; individual sync cannot proceed."
@@ -1581,17 +1609,34 @@ def _download_missing_album_items_by_google_id(
         if not manifest_present_initially:
             _cleanup_bootstrap_plain_duplicates(output_path, album_title, album_items)
         _rewrite_full_album_manifest(output_path, album_title)
-        return True, 0, existing_count, 0, len(album_items), deleted_count
+        return (
+            True,
+            0,
+            existing_count,
+            0,
+            len(album_items),
+            deleted_count,
+        )
 
-    downloaded_count, skipped_count, failed_count = _download_individual_album_items(
-        driver,
-        missing_items,
-        album_title,
-        output_path,
-        temp_dir_path,
-        bootstrap_from_filename=not manifest_present_initially,
-        trusted_existing_paths=trusted_existing_paths,
-    )
+    for start in range(0, len(missing_items), ALBUM_SYNC_CHUNK_SIZE):
+        chunk = missing_items[start : start + ALBUM_SYNC_CHUNK_SIZE]
+        chunk_number = (start // ALBUM_SYNC_CHUNK_SIZE) + 1
+        total_chunks = (len(missing_items) + ALBUM_SYNC_CHUNK_SIZE - 1) // ALBUM_SYNC_CHUNK_SIZE
+        logging.info(
+            f"Processing album download chunk {chunk_number}/{total_chunks} for [{album_title}] with {len(chunk)} item(s)."
+        )
+        downloaded_count, skipped_count, failed_count = _download_individual_album_items(
+            driver,
+            chunk,
+            album_title,
+            output_path,
+            temp_dir_path,
+            bootstrap_from_filename=not manifest_present_initially,
+            trusted_existing_paths=trusted_existing_paths,
+        )
+        total_downloaded += downloaded_count
+        total_skipped += skipped_count
+        total_failed += failed_count
     _ensure_album_manifest_mappings(
         output_path,
         album_title,
@@ -1604,9 +1649,9 @@ def _download_missing_album_items_by_google_id(
     _rewrite_full_album_manifest(output_path, album_title)
     return (
         True,
-        downloaded_count,
-        existing_count + skipped_count,
-        failed_count,
+        total_downloaded,
+        existing_count + total_skipped,
+        total_failed,
         len(album_items),
         deleted_count,
     )
