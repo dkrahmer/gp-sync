@@ -585,9 +585,14 @@ def _photo_image_download_url(driver, timeout: float | None = None) -> str | Non
     return f"{src}=d"
 
 
-def _collect_album_photo_items(driver) -> list[dict[str, str]]:
+def _collect_album_photo_items(
+    driver,
+    max_items: int | None = None,
+    exclude_google_ids: set[str] | None = None,
+) -> list[dict[str, str]]:
     collected: dict[str, dict[str, str]] = {}
     unchanged_steps = 0
+    excluded = {value.casefold() for value in (exclude_google_ids or set())}
 
     deadline = time.perf_counter() + WEB_DRIVER_WAIT
     while time.perf_counter() < deadline:
@@ -603,7 +608,12 @@ def _collect_album_photo_items(driver) -> list[dict[str, str]]:
         for item in items:
             google_id = str(item.get("google_id", "")).strip()
             url = str(item.get("url", "")).strip()
-            if not google_id or not url or google_id in collected:
+            if (
+                not google_id
+                or not url
+                or google_id in collected
+                or google_id.casefold() in excluded
+            ):
                 continue
             candidate_values = [
                 str(value) for value in (item.get("candidates") or []) if value
@@ -621,6 +631,8 @@ def _collect_album_photo_items(driver) -> list[dict[str, str]]:
                 "identifiers": identifiers or google_id,
             }
             new_items += 1
+            if max_items is not None and len(collected) >= max_items:
+                return list(collected.values())
 
         unchanged_steps = unchanged_steps + 1 if new_items == 0 else 0
         scroll_info = driver.execute_script(SCROLL_ALBUM_SCRIPT) or {}
