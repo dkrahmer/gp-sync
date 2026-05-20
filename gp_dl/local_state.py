@@ -78,9 +78,7 @@ def _record_google_id_file(
         return
 
     manifest = _load_google_id_manifest(album_dir)
-    files = manifest.setdefault(google_id, [])
-    if relative_name not in files:
-        files.append(relative_name)
+    manifest[str(google_id)] = relative_name
     _save_google_id_manifest(album_dir, manifest)
 
 
@@ -100,22 +98,26 @@ def _local_album_google_id_files(
 ) -> tuple[dict[str, list[Path]], list[Path]]:
     album_dirs = _album_output_dirs(output_path, album_title)
     files_by_google_id: dict[str, list[Path]] = {}
+    ids_from_manifest: set[str] = set()
 
     for album_dir in album_dirs:
         if not album_dir.exists() or not album_dir.is_dir():
             continue
 
         manifest = _load_google_id_manifest(album_dir)
-        for google_id, filenames in manifest.items():
+        for google_id, filename in manifest.items():
             google_id_key = google_id.casefold()
-            for filename in filenames:
-                file_path = (album_dir / filename).resolve()
-                if not file_path.exists() or not file_path.is_file():
-                    continue
-                if not _is_path_within(file_path, output_path):
-                    continue
-                if file_path not in files_by_google_id.setdefault(google_id_key, []):
-                    files_by_google_id[google_id_key].append(file_path)
+            file_path = (album_dir / filename).resolve()
+            if not file_path.exists() or not file_path.is_file():
+                continue
+            if not _is_path_within(file_path, output_path):
+                continue
+            ids_from_manifest.add(google_id_key)
+            files_by_google_id[google_id_key] = [file_path]
+
+    for album_dir in album_dirs:
+        if not album_dir.exists() or not album_dir.is_dir():
+            continue
 
         for root, _, files in os.walk(album_dir):
             for filename in files:
@@ -126,8 +128,10 @@ def _local_album_google_id_files(
                 google_id = _extract_google_id_from_filename(filename)
                 if not google_id:
                     continue
-                file_path = Path(root) / filename
                 google_id_key = google_id.casefold()
+                if google_id_key in ids_from_manifest:
+                    continue
+                file_path = Path(root) / filename
                 if file_path not in files_by_google_id.setdefault(google_id_key, []):
                     files_by_google_id[google_id_key].append(file_path)
 

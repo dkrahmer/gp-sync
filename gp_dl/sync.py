@@ -1,4 +1,6 @@
 import logging
+import os
+import re
 import shutil
 import time
 from pathlib import Path
@@ -22,11 +24,159 @@ from .local_state import (
     _record_google_id_file,
     _sanitize_path_component,
 )
-from .parsing import _download_response_filename, _item_looks_like_video
+from .manifest import (
+    GOOGLE_ID_MANIFEST_FILENAME,
+    _load_google_id_manifest,
+    _save_google_id_manifest,
+)
+from .parsing import (
+    _download_response_filename,
+    _extract_google_id_from_filename,
+    _extract_media_filenames,
+    _item_looks_like_video,
+    _normalize_filename,
+)
+
+
+def _filename_with_google_id_suffix(filename: str, google_id: str) -> str:
+    path = Path(filename)
+    return f"{path.stem}__gp-{google_id}{path.suffix}"
+
+
+def _path_conflicts_case_insensitive(path: Path) -> bool:
+    if path.exists():
+        return True
+
+    parent = path.parent
+    if not parent.exists() or not parent.is_dir():
+        return False
+
+    target_name = path.name.casefold()
+    try:
+        for child in parent.iterdir():
+            if child.is_file() and child.name.casefold() == target_name:
+                return True
+    except OSError:
+        return path.exists()
+
+    return False
+
+
+def _ensure_unique_path(path: Path) -> Path:
+    if not _path_conflicts_case_insensitive(path):
+        return path
+
+    counter = 1
+    while True:
+        candidate = path.with_name(f"{path.stem}__{counter}{path.suffix}")
+        if not _path_conflicts_case_insensitive(candidate):
+            return candidate
+        counter += 1
+
+
+def _find_conflicting_file_case_insensitive(path: Path) -> Path | None:
+    parent = path.parent
+    if not parent.exists() or not parent.is_dir():
+        return None
+
+    target_name = path.name.casefold()
+    try:
+        for child in parent.iterdir():
+            if child.is_file() and child.name.casefold() == target_name:
+                return child.resolve()
+    except OSError:
+        return None
+
+    return None
+
+
+GOOGLE_ID_SUFFIX_IN_STEM_RE = re.compile(r"__gp-[A-Za-z0-9_-]+$", re.IGNORECASE)
+
+
+def _normalized_match_filename(filename: str) -> str:
+    path = Path(filename)
+    stem = GOOGLE_ID_SUFFIX_IN_STEM_RE.sub("", path.stem)
+    return _normalize_filename(f"{stem}{path.suffix}")
+
+
+def _path_match_priority(path: Path) -> tuple[int, str]:
+    has_id_suffix = _extract_google_id_from_filename(path.name) is not None
+    return (0 if not has_id_suffix else 1, path.name.casefold())
+
+
+def _find_existing_album_file_for_filename(
+    output_path: Path,
+    album_title: str,
+    filename: str,
+    exclude_paths: set[Path] | None = None,
+) -> Path | None:
+    normalized = _normalized_match_filename(filename)
+    files_by_name, _ = _local_album_files_by_normalized_name(output_path, album_title)
+    for candidate in sorted(
+        files_by_name.get(normalized, []), key=_path_match_priority
+    ):
+        resolved = candidate.resolve()
+        if exclude_paths and resolved in exclude_paths:
+            continue
+        if resolved.exists() and resolved.is_file():
+            return resolved
+    return None
+
+
+def _local_album_files_by_normalized_name(
+    output_path: Path, album_title: str
+) -> tuple[dict[str, list[Path]], list[Path]]:
+    album_dirs = _album_output_dirs(output_path, album_title)
+    files_by_name: dict[str, list[Path]] = {}
+
+    for album_dir in album_dirs:
+        if not album_dir.exists() or not album_dir.is_dir():
+            continue
+        for root, _, files in os.walk(album_dir):
+            for filename in files:
+                if filename == GOOGLE_ID_MANIFEST_FILENAME:
+                    continue
+                normalized = _normalized_match_filename(filename)
+                extension = os.path.splitext(normalized)[1]
+                if not extension:
+                    continue
+                file_path = (Path(root) / filename).resolve()
+                if not file_path.exists() or not file_path.is_file():
+                    continue
+                if not _is_path_within(file_path, output_path):
+                    continue
+                if file_path not in files_by_name.setdefault(normalized, []):
+                    files_by_name[normalized].append(file_path)
+
+    return files_by_name, album_dirs
+
+
+def _record_google_id_for_existing_path(
+    album_dirs: list[Path],
+    google_id: str,
+    file_path: Path,
+    target_album_dir: Path,
+    output_path: Path,
+) -> None:
+    album_dir = next(
+        (
+            candidate
+            for candidate in album_dirs
+            if candidate.exists()
+            and candidate.is_dir()
+            and _is_path_within(file_path, candidate)
+        ),
+        target_album_dir,
+    )
+    _record_google_id_file(album_dir, google_id, file_path, output_path)
 
 
 def _download_motion_photo_still(
-    driver, google_id: str, target_album_dir: Path, output_path: Path
+    driver,
+    google_id: str,
+    target_album_dir: Path,
+    output_path: Path,
+    bootstrap_from_filename: bool = False,
 ) -> Path | None:
     download_url = _photo_image_download_url(driver)
     if not download_url:
@@ -56,11 +206,39 @@ def _download_motion_photo_still(
                 )
                 return None
 
+            if _path_conflicts_case_insensitive(resolved_target):
+                if bootstrap_from_filename:
+                    existing_target = _find_conflicting_file_case_insensitive(
+                        resolved_target
+                    )
+                    if existing_target is not None:
+                        _record_google_id_file(
+                            target_album_dir, google_id, existing_target, output_path
+                        )
+                        logging.info(
+                            f"Matched existing motion photo still by filename for Google Photos item {google_id}: {existing_target}. Added mapping to {GOOGLE_ID_MANIFEST_FILENAME}."
+                        )
+                        return existing_target
+                    logging.error(
+                        f"Refusing to create ID-suffixed duplicate for motion photo item {google_id} during no-manifest bootstrap; downloaded filename would be {filename}."
+                    )
+                    return None
+
+                target_name = _filename_with_google_id_suffix(filename, google_id)
+                resolved_target = (target_album_dir / target_name).resolve()
+                if not _is_path_within(resolved_target, output_path):
+                    logging.error(
+                        f"Skipping direct still download with unsafe path: {target_name}"
+                    )
+                    return None
+                resolved_target = _ensure_unique_path(resolved_target)
+                logging.debug(
+                    f"Filename collision for motion photo item {google_id}; saving as {resolved_target.name}"
+                )
+
             temp_target = resolved_target.with_suffix(f"{resolved_target.suffix}.tmp")
             with open(temp_target, "wb") as target_file:
                 shutil.copyfileobj(response, target_file)
-            if resolved_target.exists():
-                resolved_target.unlink()
             temp_target.replace(resolved_target)
             _record_google_id_file(
                 target_album_dir, google_id, resolved_target, output_path
@@ -74,12 +252,226 @@ def _download_motion_photo_still(
         return None
 
 
+def _rewrite_full_album_manifest(output_path: Path, album_title: str) -> None:
+    album_dirs = _album_output_dirs(output_path, album_title)
+    target_album_dir = next(
+        (path for path in album_dirs if path.exists() and path.is_dir()),
+        output_path / _sanitize_path_component(album_title),
+    )
+    target_album_dir.mkdir(parents=True, exist_ok=True)
+
+    preferred_by_id: dict[str, Path] = {}
+    for album_dir in album_dirs:
+        if not album_dir.exists() or not album_dir.is_dir():
+            continue
+        manifest = _load_google_id_manifest(album_dir)
+        for google_id, filename in manifest.items():
+            resolved = (album_dir / filename).resolve()
+            if (
+                resolved.exists()
+                and resolved.is_file()
+                and _is_path_within(resolved, output_path)
+            ):
+                preferred_by_id.setdefault(google_id.casefold(), resolved)
+
+    files_by_google_id, _ = _local_album_google_id_files(output_path, album_title)
+    full_manifest: dict[str, str] = {}
+
+    for google_id_key, paths in files_by_google_id.items():
+        valid_paths = [
+            path.resolve()
+            for path in paths
+            if path.exists()
+            and path.is_file()
+            and _is_path_within(path.resolve(), output_path)
+        ]
+        if not valid_paths:
+            continue
+
+        chosen = preferred_by_id.get(google_id_key)
+        if chosen is None:
+            chosen = sorted(valid_paths, key=lambda value: str(value).casefold())[0]
+
+        if not _is_path_within(chosen, target_album_dir):
+            continue
+
+        relative_name = chosen.relative_to(target_album_dir.resolve()).as_posix()
+        full_manifest[google_id_key] = relative_name
+
+    _save_google_id_manifest(target_album_dir, full_manifest)
+
+
+def _cleanup_bootstrap_plain_duplicates(
+    output_path: Path, album_title: str, album_items: list[dict[str, str]]
+) -> None:
+    # Bootstrap mode should preserve existing plain filenames and avoid destructive
+    # cleanup. We keep this function as a no-op for backwards compatibility.
+    _ = (output_path, album_title, album_items)
+    return
+
+
+def _delete_duplicate_files_for_manifest_ids(
+    output_path: Path, album_title: str
+) -> None:
+    album_dirs = _album_output_dirs(output_path, album_title)
+    manifest_id_paths: dict[str, Path] = {}
+    manifest_listed_paths: set[Path] = set()
+
+    for album_dir in album_dirs:
+        if not album_dir.exists() or not album_dir.is_dir():
+            continue
+        manifest = _load_google_id_manifest(album_dir)
+        for google_id, filename in manifest.items():
+            resolved = (album_dir / filename).resolve()
+            if not resolved.exists() or not resolved.is_file():
+                continue
+            if not _is_path_within(resolved, output_path):
+                continue
+            manifest_listed_paths.add(resolved)
+            manifest_id_paths.setdefault(google_id.casefold(), resolved)
+
+    if not manifest_id_paths:
+        return
+
+    for album_dir in album_dirs:
+        if not album_dir.exists() or not album_dir.is_dir():
+            continue
+        for root, _, files in os.walk(album_dir):
+            for filename in files:
+                if filename == GOOGLE_ID_MANIFEST_FILENAME:
+                    continue
+                google_id = _extract_google_id_from_filename(filename)
+                if not google_id:
+                    continue
+
+                resolved = (Path(root) / filename).resolve()
+                if not resolved.exists() or not resolved.is_file():
+                    continue
+                if not _is_path_within(resolved, output_path):
+                    continue
+
+                winner = manifest_id_paths.get(google_id.casefold())
+                if winner is None or resolved == winner:
+                    continue
+                if resolved in manifest_listed_paths:
+                    continue
+
+                _delete_local_album_file(
+                    resolved,
+                    output_path,
+                    f"duplicate for Google ID {google_id}; {GOOGLE_ID_MANIFEST_FILENAME} mapping wins",
+                )
+
+
+def _ensure_album_manifest_mappings(
+    output_path: Path,
+    album_title: str,
+    album_items: list[dict[str, str]],
+    cleanup_duplicates: bool = True,
+) -> None:
+    album_dirs = _album_output_dirs(output_path, album_title)
+    target_album_dir = next(
+        (path for path in album_dirs if path.exists() and path.is_dir()),
+        output_path / _sanitize_path_component(album_title),
+    )
+    target_album_dir.mkdir(parents=True, exist_ok=True)
+
+    files_by_name, album_dirs = _local_album_files_by_normalized_name(
+        output_path, album_title
+    )
+    files_by_google_id, _ = _local_album_google_id_files(output_path, album_title)
+    manifest_has_entries = any(
+        _load_google_id_manifest(album_dir) for album_dir in album_dirs
+    )
+    assigned_paths = {
+        path.resolve()
+        for paths in files_by_google_id.values()
+        for path in paths
+        if path.exists() and path.is_file()
+    }
+
+    if manifest_has_entries:
+        for paths in files_by_name.values():
+            for path in paths:
+                google_id = _extract_google_id_from_filename(path.name)
+                if not google_id:
+                    continue
+                google_id_key = google_id.casefold()
+                existing_paths = [
+                    existing_path.resolve()
+                    for existing_path in files_by_google_id.get(google_id_key, [])
+                    if existing_path.exists() and existing_path.is_file()
+                ]
+                if existing_paths:
+                    continue
+                resolved = path.resolve()
+                _record_google_id_for_existing_path(
+                    album_dirs,
+                    google_id,
+                    resolved,
+                    target_album_dir,
+                    output_path,
+                )
+                assigned_paths.add(resolved)
+
+    files_by_google_id, _ = _local_album_google_id_files(output_path, album_title)
+    assigned_paths = {
+        path.resolve()
+        for paths in files_by_google_id.values()
+        for path in paths
+        if path.exists() and path.is_file()
+    }
+
+    for item in album_items:
+        google_id = str(item.get("google_id", "")).strip()
+        if not google_id:
+            continue
+
+        existing_paths = files_by_google_id.get(google_id.casefold(), [])
+        if any(path.exists() and path.is_file() for path in existing_paths):
+            continue
+
+        candidate_filenames = _extract_media_filenames(
+            str(item.get("identifiers", "") or "")
+        )
+        matched_existing = None
+        for filename in candidate_filenames:
+            normalized = _normalized_match_filename(filename)
+            candidate_paths = sorted(
+                files_by_name.get(normalized, []), key=_path_match_priority
+            )
+            for path in candidate_paths:
+                resolved = path.resolve()
+                if resolved in assigned_paths:
+                    continue
+                matched_existing = resolved
+                break
+            if matched_existing is not None:
+                break
+
+        if matched_existing is None:
+            continue
+
+        _record_google_id_for_existing_path(
+            album_dirs,
+            google_id,
+            matched_existing,
+            target_album_dir,
+            output_path,
+        )
+        assigned_paths.add(matched_existing)
+
+    if cleanup_duplicates:
+        _delete_duplicate_files_for_manifest_ids(output_path, album_title)
+
+
 def _download_individual_album_items(
     driver,
     items: list[dict[str, str]],
     album_title: str,
     output_path: Path,
     temp_dir_path: Path,
+    bootstrap_from_filename: bool = False,
 ) -> tuple[int, int, int]:
     album_dirs = _album_output_dirs(output_path, album_title)
     target_album_dir = next(
@@ -91,6 +483,11 @@ def _download_individual_album_items(
     downloaded_count = 0
     skipped_count = 0
     failed_count = 0
+
+    files_by_name, album_dirs = _local_album_files_by_normalized_name(
+        output_path, album_title
+    )
+    consumed_name_match_paths: set[Path] = set()
 
     for item in items:
         google_id = item["google_id"]
@@ -107,6 +504,50 @@ def _download_individual_album_items(
             skipped_count += 1
             continue
 
+        if bootstrap_from_filename:
+            candidate_filenames = _extract_media_filenames(
+                str(item.get("identifiers", "") or "")
+            )
+            assigned_paths = {
+                path.resolve()
+                for existing_paths in files_by_google_id.values()
+                for path in existing_paths
+            }
+            matched_existing = None
+            for filename in candidate_filenames:
+                normalized = _normalized_match_filename(filename)
+                paths = sorted(
+                    files_by_name.get(normalized, []), key=_path_match_priority
+                )
+                for path in paths:
+                    resolved = path.resolve()
+                    if (
+                        resolved in consumed_name_match_paths
+                        or resolved in assigned_paths
+                    ):
+                        continue
+                    matched_existing = resolved
+                    break
+                if matched_existing is not None:
+                    break
+
+            if matched_existing is not None:
+                consumed_name_match_paths.add(matched_existing)
+
+            if matched_existing is not None:
+                _record_google_id_for_existing_path(
+                    album_dirs,
+                    google_id,
+                    matched_existing,
+                    target_album_dir,
+                    output_path,
+                )
+                logging.info(
+                    f"Matched existing file by filename for Google Photos item {google_id}: {matched_existing}. Added mapping to {GOOGLE_ID_MANIFEST_FILENAME}."
+                )
+                skipped_count += 1
+                continue
+
         logging.info(f"Downloading missing Google Photos item {google_id}")
         driver.get(item["url"])
 
@@ -117,7 +558,11 @@ def _download_individual_album_items(
                 )
             else:
                 still_path = _download_motion_photo_still(
-                    driver, google_id, target_album_dir, output_path
+                    driver,
+                    google_id,
+                    target_album_dir,
+                    output_path,
+                    bootstrap_from_filename=bootstrap_from_filename,
                 )
                 if still_path:
                     downloaded_count += 1
@@ -165,6 +610,30 @@ def _download_individual_album_items(
 
         downloaded_path = temp_dir_path / downloaded_file
         downloaded_name = downloaded_path.name
+
+        if bootstrap_from_filename:
+            matched_existing = _find_existing_album_file_for_filename(
+                output_path,
+                album_title,
+                downloaded_name,
+                exclude_paths={downloaded_path.resolve()},
+            )
+            if matched_existing is not None:
+                _record_google_id_for_existing_path(
+                    album_dirs,
+                    google_id,
+                    matched_existing,
+                    target_album_dir,
+                    output_path,
+                )
+                logging.info(
+                    f"Matched existing file after download by filename for Google Photos item {google_id}: {matched_existing}. Added mapping to {GOOGLE_ID_MANIFEST_FILENAME}."
+                )
+                skipped_count += 1
+                if downloaded_path.exists():
+                    downloaded_path.unlink()
+                continue
+
         target_name = downloaded_name
         resolved_target = (target_album_dir / target_name).resolve()
 
@@ -182,19 +651,94 @@ def _download_individual_album_items(
                 downloaded_path.unlink()
             continue
 
-        if resolved_target.exists():
-            logging.debug(f"Skipping existing file {resolved_target}")
-            skipped_count += 1
-            if (
-                downloaded_path.resolve() != resolved_target
-                and downloaded_path.exists()
-            ):
-                downloaded_path.unlink()
-            continue
+        if _path_conflicts_case_insensitive(resolved_target):
+            conflicting_path = _find_conflicting_file_case_insensitive(resolved_target)
+            files_by_google_id, _ = _local_album_google_id_files(
+                output_path, album_title
+            )
+            path_to_google_ids: dict[Path, set[str]] = {}
+            for existing_google_id, existing_paths in files_by_google_id.items():
+                for existing_path in existing_paths:
+                    resolved_existing = existing_path.resolve()
+                    if (
+                        not resolved_existing.exists()
+                        or not resolved_existing.is_file()
+                    ):
+                        continue
+                    path_to_google_ids.setdefault(resolved_existing, set()).add(
+                        existing_google_id
+                    )
+
+            if bootstrap_from_filename:
+                bootstrap_match = _find_existing_album_file_for_filename(
+                    output_path,
+                    album_title,
+                    downloaded_name,
+                    exclude_paths={downloaded_path.resolve()},
+                )
+                if bootstrap_match is None and conflicting_path is not None:
+                    resolved_conflict = conflicting_path.resolve()
+                    if resolved_conflict != downloaded_path.resolve():
+                        bootstrap_match = resolved_conflict
+
+                if bootstrap_match is not None:
+                    _record_google_id_for_existing_path(
+                        album_dirs,
+                        google_id,
+                        bootstrap_match,
+                        target_album_dir,
+                        output_path,
+                    )
+                    logging.info(
+                        f"Matched existing file by bootstrap filename collision for Google Photos item {google_id}: {bootstrap_match}. Added mapping to {GOOGLE_ID_MANIFEST_FILENAME}."
+                    )
+                    skipped_count += 1
+                    if downloaded_path.exists():
+                        downloaded_path.unlink()
+                    continue
+
+                logging.error(
+                    f"Refusing to create ID-suffixed duplicate for Google Photos item {google_id} during no-manifest bootstrap; downloaded file was {downloaded_name}."
+                )
+                failed_count += 1
+                if downloaded_path.exists():
+                    downloaded_path.unlink()
+                continue
+
+            if conflicting_path is not None:
+                owner_ids = path_to_google_ids.get(conflicting_path.resolve(), set())
+                if not owner_ids or google_id.casefold() in owner_ids:
+                    _record_google_id_for_existing_path(
+                        album_dirs,
+                        google_id,
+                        conflicting_path,
+                        target_album_dir,
+                        output_path,
+                    )
+                    logging.info(
+                        f"Matched existing file by filename collision for Google Photos item {google_id}: {conflicting_path}. Added mapping to {GOOGLE_ID_MANIFEST_FILENAME}."
+                    )
+                    skipped_count += 1
+                    if downloaded_path.exists():
+                        downloaded_path.unlink()
+                    continue
+
+            target_name = _filename_with_google_id_suffix(downloaded_name, google_id)
+            resolved_target = (target_album_dir / target_name).resolve()
+            if not _is_path_within(resolved_target, output_path):
+                logging.error(
+                    f"Skipping downloaded file with unsafe path: {target_name}"
+                )
+                failed_count += 1
+                if downloaded_path.exists():
+                    downloaded_path.unlink()
+                continue
+            resolved_target = _ensure_unique_path(resolved_target)
+            logging.debug(
+                f"Filename collision for Google Photos item {google_id}; saving as {resolved_target.name}"
+            )
 
         if downloaded_path.resolve() != resolved_target:
-            if resolved_target.exists():
-                resolved_target.unlink()
             _ = shutil.move(str(downloaded_path), str(resolved_target))
 
         final_name = resolved_target.name
@@ -228,21 +772,50 @@ def _delete_local_album_file(path: Path, output_path: Path, reason: str) -> bool
 
 
 def _propagate_album_deletes(
-    output_path: Path, album_title: str, album_google_ids: set[str]
+    output_path: Path,
+    album_title: str,
+    album_google_ids: set[str],
+    delete_without_google_id: bool = True,
 ) -> int:
-    files_by_google_id, _ = _local_album_google_id_files(output_path, album_title)
+    files_by_google_id, album_dirs = _local_album_google_id_files(
+        output_path, album_title
+    )
     deleted_count = 0
+
+    manifest_listed_paths: set[Path] = set()
+    for album_dir in album_dirs:
+        manifest = _load_google_id_manifest(album_dir)
+        for filename in manifest.values():
+            resolved = (album_dir / filename).resolve()
+            if not resolved.exists() or not resolved.is_file():
+                continue
+            if not _is_path_within(resolved, output_path):
+                continue
+            manifest_listed_paths.add(resolved)
 
     for google_id, paths in files_by_google_id.items():
         if google_id in album_google_ids:
             continue
         for path in paths:
-            if _delete_local_album_file(path, output_path, "missing from album"):
+            resolved = path.resolve()
+            if resolved in manifest_listed_paths:
+                logging.info(
+                    f"Keeping local file listed in {GOOGLE_ID_MANIFEST_FILENAME}: {resolved}"
+                )
+                continue
+            if _delete_local_album_file(resolved, output_path, "missing from album"):
                 deleted_count += 1
 
-    for path in _local_album_files_without_google_id(output_path, album_title):
-        if _delete_local_album_file(path, output_path, "without Google ID"):
-            deleted_count += 1
+    if delete_without_google_id:
+        for path in _local_album_files_without_google_id(output_path, album_title):
+            resolved = path.resolve()
+            if resolved in manifest_listed_paths:
+                logging.info(
+                    f"Keeping local file listed in {GOOGLE_ID_MANIFEST_FILENAME}: {resolved}"
+                )
+                continue
+            if _delete_local_album_file(resolved, output_path, "without Google ID"):
+                deleted_count += 1
 
     result = (
         f"deleted {deleted_count} local file(s)."
@@ -260,8 +833,6 @@ def _download_missing_album_items_by_google_id(
     temp_dir_path: Path,
     propagate_deletes: bool,
 ) -> tuple[bool, int, int, int, int, int]:
-    files_by_google_id, _ = _local_album_google_id_files(output_path, album_title)
-    existing_google_ids = set(files_by_google_id)
     album_items = _collect_album_photo_items(driver)
     if not album_items:
         logging.info(
@@ -269,9 +840,95 @@ def _download_missing_album_items_by_google_id(
         )
         return False, 0, 0, 0, 0, 0
 
+    album_dirs = _album_output_dirs(output_path, album_title)
+    manifest_present_initially = any(
+        (album_dir / GOOGLE_ID_MANIFEST_FILENAME).exists() for album_dir in album_dirs
+    )
+
+    _ensure_album_manifest_mappings(
+        output_path,
+        album_title,
+        album_items,
+        cleanup_duplicates=manifest_present_initially,
+    )
+
+    files_by_google_id, album_dirs = _local_album_google_id_files(
+        output_path, album_title
+    )
+
+    if not manifest_present_initially:
+        files_by_name, _ = _local_album_files_by_normalized_name(
+            output_path, album_title
+        )
+        claimed_paths = {
+            path.resolve()
+            for paths in files_by_google_id.values()
+            for path in paths
+            if path.exists() and path.is_file()
+        }
+        target_album_dir = next(
+            (path for path in album_dirs if path.exists() and path.is_dir()),
+            output_path / _sanitize_path_component(album_title),
+        )
+
+        for item in album_items:
+            google_id = str(item.get("google_id", "")).strip()
+            if not google_id:
+                continue
+            if google_id.casefold() in files_by_google_id:
+                continue
+
+            candidate_filenames = _extract_media_filenames(
+                str(item.get("identifiers", "") or "")
+            )
+            matched_existing = None
+            for filename in sorted(candidate_filenames):
+                normalized = _normalized_match_filename(filename)
+                candidate_paths = sorted(
+                    files_by_name.get(normalized, []), key=_path_match_priority
+                )
+                for path in candidate_paths:
+                    resolved = path.resolve()
+                    if (
+                        not resolved.exists()
+                        or not resolved.is_file()
+                        or resolved in claimed_paths
+                    ):
+                        continue
+                    matched_existing = resolved
+                    break
+                if matched_existing is not None:
+                    break
+
+            if matched_existing is None:
+                continue
+
+            _record_google_id_for_existing_path(
+                album_dirs,
+                google_id,
+                matched_existing,
+                target_album_dir,
+                output_path,
+            )
+            claimed_paths.add(matched_existing)
+
+        files_by_google_id, _ = _local_album_google_id_files(output_path, album_title)
+
+    existing_google_ids = set(files_by_google_id)
     album_google_ids = {item["google_id"].casefold() for item in album_items}
+
+    if propagate_deletes and not manifest_present_initially:
+        logging.info(
+            f"Skipping delete propagation for files without Google ID in album [{album_title}] because {GOOGLE_ID_MANIFEST_FILENAME} did not exist before this run."
+        )
+
     deleted_count = (
-        _propagate_album_deletes(output_path, album_title, album_google_ids)
+        _propagate_album_deletes(
+            output_path,
+            album_title,
+            album_google_ids,
+            delete_without_google_id=manifest_present_initially,
+        )
         if propagate_deletes
         else 0
     )
@@ -288,11 +945,28 @@ def _download_missing_album_items_by_google_id(
     )
 
     if not missing_items:
+        if not manifest_present_initially:
+            _cleanup_bootstrap_plain_duplicates(output_path, album_title, album_items)
+        _rewrite_full_album_manifest(output_path, album_title)
         return True, 0, existing_count, 0, len(album_items), deleted_count
 
     downloaded_count, skipped_count, failed_count = _download_individual_album_items(
-        driver, missing_items, album_title, output_path, temp_dir_path
+        driver,
+        missing_items,
+        album_title,
+        output_path,
+        temp_dir_path,
+        bootstrap_from_filename=not manifest_present_initially,
     )
+    _ensure_album_manifest_mappings(
+        output_path,
+        album_title,
+        album_items,
+        cleanup_duplicates=manifest_present_initially,
+    )
+    if not manifest_present_initially:
+        _cleanup_bootstrap_plain_duplicates(output_path, album_title, album_items)
+    _rewrite_full_album_manifest(output_path, album_title)
     return (
         True,
         downloaded_count,

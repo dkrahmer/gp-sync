@@ -117,13 +117,33 @@ window.scrollTo(0, 0);
 """
 
 COLLECT_ALBUM_PHOTO_LINKS_SCRIPT = r"""
+function addCandidate(list, value) {
+    if (value === undefined || value === null) return;
+    const text = String(value).trim();
+    if (text) list.push(text);
+}
+
+function collectCandidates(anchor) {
+    const candidates = [];
+    const attrs = ['data-filename', 'aria-label', 'title', 'alt', 'download', 'href', 'src'];
+    const elements = [anchor, ...Array.from(anchor.querySelectorAll('[data-filename], [aria-label], [title], img, a, video, source'))].slice(0, 100);
+    for (const item of elements) {
+        for (const attr of attrs) addCandidate(candidates, item.getAttribute && item.getAttribute(attr));
+        if (item.dataset) {
+            for (const value of Object.values(item.dataset)) addCandidate(candidates, value);
+        }
+    }
+    return Array.from(new Set(candidates)).slice(0, 80);
+}
+
 return Array.from(document.querySelectorAll('a[href*="/photo/"]')).map((anchor) => {
     const href = anchor.href || anchor.getAttribute('href') || '';
     const idMatch = href.match(/\/photo\/([^/?#]+)/);
     return {
         url: href,
         google_id: idMatch ? idMatch[1] : '',
-        aria: anchor.getAttribute('aria-label') || ''
+        aria: anchor.getAttribute('aria-label') || '',
+        candidates: collectCandidates(anchor)
     };
 }).filter((item) => item.url && item.google_id);
 """
@@ -517,10 +537,20 @@ def _collect_album_photo_items(driver) -> list[dict[str, str]]:
             url = str(item.get("url", "")).strip()
             if not google_id or not url or google_id in collected:
                 continue
+            candidate_values = [
+                str(value) for value in (item.get("candidates") or []) if value
+            ]
+            filenames = set()
+            for value in candidate_values:
+                filenames.update(_extract_media_filenames(value))
+
+            identifiers = [str(item.get("aria", "") or "").strip(), *sorted(filenames)]
+            identifiers = ", ".join(value for value in identifiers if value)
+
             collected[google_id] = {
                 "url": url,
                 "google_id": google_id,
-                "identifiers": str(item.get("aria", "") or google_id),
+                "identifiers": identifiers or google_id,
             }
             new_items += 1
 

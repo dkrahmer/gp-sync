@@ -9,7 +9,7 @@ def _manifest_path(album_dir: Path) -> Path:
     return album_dir / GOOGLE_ID_MANIFEST_FILENAME
 
 
-def _load_google_id_manifest(album_dir: Path) -> dict[str, list[str]]:
+def _load_google_id_manifest(album_dir: Path) -> dict[str, str]:
     path = _manifest_path(album_dir)
     if not path.exists():
         return {}
@@ -25,16 +25,17 @@ def _load_google_id_manifest(album_dir: Path) -> dict[str, list[str]]:
     if not isinstance(entries, dict):
         return {}
 
-    manifest: dict[str, list[str]] = {}
-    for google_id, filenames in entries.items():
-        if isinstance(filenames, str):
-            manifest[str(google_id)] = [filenames]
-        elif isinstance(filenames, list):
-            manifest[str(google_id)] = [str(filename) for filename in filenames]
+    manifest: dict[str, str] = {}
+    for google_id, filename in entries.items():
+        google_id_key = str(google_id)
+        if isinstance(filename, str):
+            manifest[google_id_key] = str(filename)
+        elif isinstance(filename, list) and filename:
+            manifest[google_id_key] = str(filename[0])
     return manifest
 
 
-def _save_google_id_manifest(album_dir: Path, manifest: dict[str, list[str]]) -> None:
+def _save_google_id_manifest(album_dir: Path, manifest: dict[str, str]) -> None:
     path = _manifest_path(album_dir)
     try:
         with open(path, "w", encoding="utf-8") as manifest_file:
