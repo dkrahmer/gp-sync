@@ -447,9 +447,16 @@ def _prepare_filtered_album_download(
 
 def _start_download_with_keyboard_shortcut(driver) -> bool:
     try:
-        ActionChains(driver).key_down(Keys.SHIFT).send_keys("d").key_up(
+        body = WebDriverWait(driver, max(1, min(WEB_DRIVER_WAIT, 5))).until(
+            EC.presence_of_element_located((By.TAG_NAME, "body"))
+        )
+        try:
+            body.click()
+        except Exception:
+            pass
+        ActionChains(driver).move_to_element(body).click(body).key_down(
             Keys.SHIFT
-        ).perform()
+        ).send_keys("d").key_up(Keys.SHIFT).perform()
         return True
     except Exception as e:
         logging.debug(f"Keyboard download shortcut failed: {e}")

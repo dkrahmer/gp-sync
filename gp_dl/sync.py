@@ -4,16 +4,12 @@ import re
 import shutil
 import time
 from pathlib import Path
-from urllib.request import Request, urlopen
 
 from .browser import find_completed_download_file
 from .config import WEB_DRIVER_WAIT
 from .google_photos_ui import (
     _collect_album_photo_items,
-    _is_motion_photo_page,
-    _photo_image_download_url,
     _start_download_with_keyboard_shortcut,
-    _start_google_photos_download,
     _wait_for_download_start,
 )
 from .local_state import (
@@ -30,10 +26,8 @@ from .manifest import (
     _save_google_id_manifest,
 )
 from .parsing import (
-    _download_response_filename,
     _extract_google_id_from_filename,
     _extract_media_filenames,
-    _item_looks_like_video,
     _normalize_filename,
 )
 
@@ -172,104 +166,6 @@ def _record_google_id_for_existing_path(
         target_album_dir,
     )
     _record_google_id_file(album_dir, google_id, file_path, output_path)
-
-
-def _download_motion_photo_still(
-    driver,
-    google_id: str,
-    target_album_dir: Path,
-    output_path: Path,
-    bootstrap_from_filename: bool = False,
-    trusted_existing_paths: set[Path] | None = None,
-    expected_filenames: set[str] | None = None,
-) -> Path | None:
-    download_url = _photo_image_download_url(driver)
-    if not download_url:
-        return None
-
-    try:
-        cookie_header = "; ".join(
-            f"{cookie['name']}={cookie['value']}" for cookie in driver.get_cookies()
-        )
-        headers = {"User-Agent": "Mozilla/5.0"}
-        if cookie_header:
-            headers["Cookie"] = cookie_header
-        request = Request(download_url, headers=headers)
-        with urlopen(request, timeout=max(WEB_DRIVER_WAIT, 10) * 3) as response:
-            filename = _download_response_filename(response)
-            if not filename:
-                logging.debug(
-                    f"Could not determine Google-provided filename for direct image download of Google Photos item {google_id}; refusing to infer a filename or extension from the rendered image URL."
-                )
-                return None
-
-            if expected_filenames:
-                expected_names = {
-                    _normalized_match_filename(expected)
-                    for expected in expected_filenames
-                }
-                if _normalized_match_filename(filename) not in expected_names:
-                    logging.info(
-                        f"Rejected direct image download for Google Photos item {google_id}; response filename {filename} did not match expected album filename(s): {sorted(expected_filenames)}."
-                    )
-                    return None
-
-            target_name = filename
-            resolved_target = (target_album_dir / target_name).resolve()
-            if not _is_path_within(resolved_target, output_path):
-                logging.error(
-                    f"Skipping direct still download with unsafe path: {target_name}"
-                )
-                return None
-
-            if _path_conflicts_case_insensitive(resolved_target):
-                if bootstrap_from_filename:
-                    existing_target = _find_conflicting_file_case_insensitive(
-                        resolved_target
-                    )
-                    if existing_target is not None and (
-                        trusted_existing_paths is None
-                        or existing_target.resolve() in trusted_existing_paths
-                    ):
-                        _record_google_id_file(
-                            target_album_dir, google_id, existing_target, output_path
-                        )
-                        logging.info(
-                            f"Matched existing file by filename for direct image download of Google Photos item {google_id}: {existing_target}. Added mapping to {GOOGLE_ID_MANIFEST_FILENAME}."
-                        )
-                        return existing_target
-
-                target_name = _filename_with_google_id_suffix(filename, google_id)
-                resolved_target = (target_album_dir / target_name).resolve()
-                if not _is_path_within(resolved_target, output_path):
-                    logging.error(
-                        f"Skipping direct still download with unsafe path: {target_name}"
-                    )
-                    return None
-                resolved_target = _ensure_unique_path(resolved_target)
-                if bootstrap_from_filename:
-                    logging.debug(
-                        f"No trusted pre-existing filename match found for direct image download of Google Photos item {google_id} during bootstrap collision; saving as {resolved_target.name}."
-                    )
-                else:
-                    logging.debug(
-                        f"Filename collision for direct image download of Google Photos item {google_id}; saving as {resolved_target.name}"
-                    )
-
-            temp_target = resolved_target.with_suffix(f"{resolved_target.suffix}.tmp")
-            with open(temp_target, "wb") as target_file:
-                shutil.copyfileobj(response, target_file)
-            temp_target.replace(resolved_target)
-            _record_google_id_file(
-                target_album_dir, google_id, resolved_target, output_path
-            )
-            logging.info(f"Saved direct image download to {resolved_target}")
-            return resolved_target
-    except Exception as e:
-        logging.debug(
-            f"Direct still download failed for Google Photos item {google_id}: {e}"
-        )
-        return None
 
 
 def _rewrite_full_album_manifest(output_path: Path, album_title: str) -> None:
@@ -583,55 +479,27 @@ def _download_individual_album_items(
         logging.info(f"Downloading missing Google Photos item {google_id}")
         driver.get(item["url"])
 
-        item_filenames = _extract_media_filenames(
-            str(item.get("identifiers", "") or "")
-        )
-        is_motion_photo = _is_motion_photo_page(driver, timeout=min(WEB_DRIVER_WAIT, 3))
-        item_looks_like_video = _item_looks_like_video(item)
-
-        if is_motion_photo and item_looks_like_video:
+        download_started = False
+        for attempt in range(1, 4):
+            triggered = _start_download_with_keyboard_shortcut(driver)
+            if triggered and _wait_for_download_start(
+                temp_dir_path,
+                {p.name for p in existing_download_files},
+                timeout=max(6.0, float(WEB_DRIVER_WAIT)),
+            ):
+                download_started = True
+                break
             logging.debug(
-                f"Google Photos item {google_id} is a video; direct still-image fallback is disabled so the downloaded file extension is preserved."
+                f"Keyboard shortcut attempt {attempt}/3 did not start a download for Google Photos item {google_id}."
             )
-
-        download_started = _start_download_with_keyboard_shortcut(
-            driver
-        ) and _wait_for_download_start(
-            temp_dir_path, {p.name for p in existing_download_files}
-        )
+            time.sleep(0.35)
 
         if not download_started:
-            logging.debug(
-                f"Keyboard shortcut did not start download for Google Photos item {google_id}; falling back to menu."
+            logging.error(
+                f"Could not start individual download for Google Photos item {google_id} using keyboard shortcut (Shift+D)."
             )
-            download_started = _start_google_photos_download(
-                driver, selected_only=True
-            ) and _wait_for_download_start(
-                temp_dir_path, {p.name for p in existing_download_files}
-            )
-            if not download_started and is_motion_photo and not item_looks_like_video:
-                logging.debug(
-                    f"Google Photos controls did not start a download for motion photo item {google_id}; trying direct image fallback."
-                )
-                still_path = _download_motion_photo_still(
-                    driver,
-                    google_id,
-                    target_album_dir,
-                    output_path,
-                    bootstrap_from_filename=bootstrap_from_filename,
-                    trusted_existing_paths=trusted_existing_paths,
-                    expected_filenames=item_filenames,
-                )
-                if still_path:
-                    downloaded_count += 1
-                    continue
-
-            if not download_started:
-                logging.error(
-                    f"Could not start individual download for Google Photos item {google_id}"
-                )
-                failed_count += 1
-                continue
+            failed_count += 1
+            continue
 
         downloaded_file = None
         deadline = time.perf_counter() + max(WEB_DRIVER_WAIT, 10) * 12
