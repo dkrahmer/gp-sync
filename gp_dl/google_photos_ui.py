@@ -464,6 +464,31 @@ def _start_download_with_keyboard_shortcut(driver) -> bool:
             f"Active-element keyboard shortcut attempt failed: {second_error}"
         )
 
+    try:
+        dispatched = driver.execute_script(
+            """
+            const target = document.activeElement || document.body || document.documentElement;
+            if (!target) return false;
+            const event = new KeyboardEvent('keydown', {
+                key: 'D',
+                code: 'KeyD',
+                shiftKey: true,
+                bubbles: true,
+                cancelable: true,
+                composed: true,
+            });
+            target.dispatchEvent(event);
+            if (document.body && document.body !== target) {
+                document.body.dispatchEvent(event);
+            }
+            return true;
+            """
+        )
+        if dispatched:
+            return True
+    except Exception as third_error:
+        logging.debug(f"DOM keyboard event dispatch failed: {third_error}")
+
     return False
 
 

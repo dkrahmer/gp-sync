@@ -114,6 +114,54 @@ def _move_download_file_with_retries(
     return False
 
 
+def _snapshot_completed_files(
+    temp_dir_path: Path,
+) -> dict[str, tuple[int, int]]:
+    snapshot: dict[str, tuple[int, int]] = {}
+    if not temp_dir_path.exists() or not temp_dir_path.is_dir():
+        return snapshot
+
+    try:
+        for child in temp_dir_path.iterdir():
+            if not child.is_file() or child.suffix.casefold() in {".crdownload", ".tmp"}:
+                continue
+            stat = child.stat()
+            snapshot[child.name] = (int(stat.st_size), int(stat.st_mtime_ns))
+    except OSError:
+        return snapshot
+
+    return snapshot
+
+
+def _find_completed_download_with_overwrite_detection(
+    temp_dir_path: Path,
+    excluded_names: set[str],
+    initial_snapshot: dict[str, tuple[int, int]],
+) -> str | None:
+    detected = find_completed_download_file(str(temp_dir_path), excluded_names)
+    if detected:
+        return detected
+
+    if not temp_dir_path.exists() or not temp_dir_path.is_dir():
+        return None
+
+    try:
+        for child in temp_dir_path.iterdir():
+            if not child.is_file() or child.suffix.casefold() in {".crdownload", ".tmp"}:
+                continue
+            if child.name not in excluded_names:
+                return child.name
+
+            stat = child.stat()
+            current = (int(stat.st_size), int(stat.st_mtime_ns))
+            if initial_snapshot.get(child.name) != current:
+                return child.name
+    except OSError:
+        return None
+
+    return None
+
+
 def _download_motion_photo_still(
     driver,
     temp_dir_path: Path,
@@ -742,6 +790,8 @@ def _download_individual_album_items(
         existing_download_files = (
             set(temp_dir_path.iterdir()) if temp_dir_path.is_dir() else set()
         )
+        existing_download_names = {p.name for p in existing_download_files}
+        existing_download_snapshot = _snapshot_completed_files(temp_dir_path)
         downloaded_path: Path | None = None
         try:
             global MOTION_PHOTO_DIRECT_SAVE_ONLY
@@ -839,7 +889,7 @@ def _download_individual_album_items(
                     and not broken_motion_page
                     and _wait_for_download_start(
                         temp_dir_path,
-                        {p.name for p in existing_download_files},
+                        existing_download_names,
                         timeout=2.0,
                     )
                 )
@@ -867,8 +917,10 @@ def _download_individual_album_items(
                     downloaded_file = None
                     deadline = time.perf_counter() + 4.0
                     while time.perf_counter() < deadline and not downloaded_file:
-                        downloaded_file = find_completed_download_file(
-                            str(temp_dir_path), {p.name for p in existing_download_files}
+                        downloaded_file = _find_completed_download_with_overwrite_detection(
+                            temp_dir_path,
+                            existing_download_names,
+                            existing_download_snapshot,
                         )
                         time.sleep(0.1)
 
@@ -893,7 +945,7 @@ def _download_individual_album_items(
                     triggered = _start_download_with_keyboard_shortcut(driver)
                     if triggered and _wait_for_download_start(
                         temp_dir_path,
-                        {p.name for p in existing_download_files},
+                        existing_download_names,
                         timeout=max(6.0, float(WEB_DRIVER_WAIT)),
                     ):
                         download_started = True
@@ -904,26 +956,48 @@ def _download_individual_album_items(
                     time.sleep(0.35)
 
                 if not download_started:
-                    logging.error(
-                        f"Could not start individual download for Google Photos item {google_id} using keyboard shortcut (Shift+D)."
+                    logging.info(
+                        f"Retrying keyboard download start for Google Photos item {google_id} after reloading the item page."
                     )
-                    _capture_download_failure_artifacts(
-                        driver,
-                        output_path,
-                        album_title,
-                        google_id,
-                        "download_not_started_shift_d",
-                        item.get("url", ""),
-                        temp_dir_path,
-                    )
-                    failed_count += 1
-                    continue
+                    driver.get(item["url"])
+                    _prepare_download_focus(driver, google_id)
+                    for attempt in range(1, 3):
+                        triggered = _start_download_with_keyboard_shortcut(driver)
+                        if triggered and _wait_for_download_start(
+                            temp_dir_path,
+                            existing_download_names,
+                            timeout=max(4.0, float(WEB_DRIVER_WAIT) / 2),
+                        ):
+                            download_started = True
+                            break
+                        logging.debug(
+                            f"Keyboard shortcut reload retry {attempt}/2 did not start a download for Google Photos item {google_id}."
+                        )
+                        time.sleep(0.35)
+
+                    if not download_started:
+                        logging.error(
+                            f"Could not start individual download for Google Photos item {google_id} using keyboard shortcut (Shift+D)."
+                        )
+                        _capture_download_failure_artifacts(
+                            driver,
+                            output_path,
+                            album_title,
+                            google_id,
+                            "download_not_started_shift_d",
+                            item.get("url", ""),
+                            temp_dir_path,
+                        )
+                        failed_count += 1
+                        continue
 
                 downloaded_file = None
                 deadline = time.perf_counter() + max(WEB_DRIVER_WAIT, 10) * 12
                 while time.perf_counter() < deadline and not downloaded_file:
-                    downloaded_file = find_completed_download_file(
-                        str(temp_dir_path), {p.name for p in existing_download_files}
+                    downloaded_file = _find_completed_download_with_overwrite_detection(
+                        temp_dir_path,
+                        existing_download_names,
+                        existing_download_snapshot,
                     )
                     time.sleep(0.1)
 
