@@ -51,9 +51,6 @@ def _album_output_dirs(output_path: Path, album_title: str) -> list[Path]:
         except OSError:
             pass
 
-    if _normalize_album_name(output_path.name) == normalized_title:
-        candidates.append(output_path)
-
     unique_candidates = []
     seen = set()
     for candidate in candidates:

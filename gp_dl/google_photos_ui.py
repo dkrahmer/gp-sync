@@ -3,7 +3,6 @@ import time
 from pathlib import Path
 
 from selenium.common.exceptions import TimeoutException
-from selenium.webdriver.common.action_chains import ActionChains
 from selenium.webdriver.common.by import By
 from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.support import expected_conditions as EC
@@ -447,13 +446,50 @@ def _prepare_filtered_album_download(
 
 def _start_download_with_keyboard_shortcut(driver) -> bool:
     try:
-        ActionChains(driver).key_down(Keys.SHIFT).send_keys("d").key_up(
-            Keys.SHIFT
-        ).perform()
+        body = WebDriverWait(driver, max(1, min(WEB_DRIVER_WAIT, 5))).until(
+            EC.presence_of_element_located((By.TAG_NAME, "body"))
+        )
+        body.send_keys(Keys.SHIFT, "d")
         return True
-    except Exception as e:
-        logging.debug(f"Keyboard download shortcut failed: {e}")
-        return False
+    except Exception as first_error:
+        logging.debug(f"Primary keyboard shortcut attempt failed: {first_error}")
+
+    try:
+        active = driver.execute_script("return document.activeElement")
+        if active is not None:
+            active.send_keys(Keys.SHIFT, "d")
+            return True
+    except Exception as second_error:
+        logging.debug(
+            f"Active-element keyboard shortcut attempt failed: {second_error}"
+        )
+
+    try:
+        dispatched = driver.execute_script(
+            """
+            const target = document.activeElement || document.body || document.documentElement;
+            if (!target) return false;
+            const event = new KeyboardEvent('keydown', {
+                key: 'D',
+                code: 'KeyD',
+                shiftKey: true,
+                bubbles: true,
+                cancelable: true,
+                composed: true,
+            });
+            target.dispatchEvent(event);
+            if (document.body && document.body !== target) {
+                document.body.dispatchEvent(event);
+            }
+            return true;
+            """
+        )
+        if dispatched:
+            return True
+    except Exception as third_error:
+        logging.debug(f"DOM keyboard event dispatch failed: {third_error}")
+
+    return False
 
 
 def _wait_for_download_start(
@@ -471,11 +507,19 @@ def _is_motion_photo_page(driver, timeout: float = 0.0) -> bool:
     deadline = time.perf_counter() + timeout
     while True:
         try:
-            if driver.find_elements(
+            controls = driver.find_elements(
                 By.XPATH,
                 '//*[@aria-label="Turn on motion" or @aria-label="Turn off motion"]',
-            ):
-                return True
+            )
+            for control in controls:
+                try:
+                    if not control.is_displayed():
+                        continue
+                    if control.rect.get("width", 0) <= 0 or control.rect.get("height", 0) <= 0:
+                        continue
+                    return True
+                except Exception:
+                    continue
         except Exception:
             return False
 
@@ -494,10 +538,34 @@ def _photo_image_download_url(driver, timeout: float | None = None) -> str | Non
         try:
             src = driver.execute_script(
                 """
+                function isVisible(img) {
+                    if (!img) return false;
+                    const rect = img.getBoundingClientRect();
+                    if (rect.width <= 1 || rect.height <= 1) return false;
+                    const style = window.getComputedStyle(img);
+                    if (!style || style.display === 'none' || style.visibility === 'hidden') return false;
+                    if (Number(style.opacity || '1') === 0) return false;
+                    return true;
+                }
+
+                const viewportWidth = window.innerWidth || document.documentElement.clientWidth || 0;
+                const viewportHeight = window.innerHeight || document.documentElement.clientHeight || 0;
+
                 const images = Array.from(document.querySelectorAll('img'))
-                    .filter((img) => img.naturalWidth > 200 && img.naturalHeight > 200)
-                    .sort((a, b) => (b.naturalWidth * b.naturalHeight) - (a.naturalWidth * a.naturalHeight));
-                return images[0] ? (images[0].currentSrc || images[0].src || images[0].getAttribute('src')) : null;
+                    .filter((img) => img.naturalWidth > 200 && img.naturalHeight > 200 && isVisible(img))
+                    .map((img) => {
+                        const rect = img.getBoundingClientRect();
+                        const inViewport = rect.bottom > 0 && rect.right > 0 && rect.top < viewportHeight && rect.left < viewportWidth;
+                        const area = rect.width * rect.height;
+                        const naturalArea = img.naturalWidth * img.naturalHeight;
+                        // Prefer currently visible/in-viewport content over hidden stale images.
+                        const score = (inViewport ? 10_000_000_000 : 0) + (area * 1000) + naturalArea;
+                        return { img, score };
+                    })
+                    .sort((a, b) => b.score - a.score);
+
+                const selected = images[0] ? images[0].img : null;
+                return selected ? (selected.currentSrc || selected.src || selected.getAttribute('src')) : null;
                 """
             )
         except Exception as e:

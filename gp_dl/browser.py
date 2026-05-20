@@ -1,5 +1,6 @@
 import logging
 import os
+import platform
 from pathlib import Path
 
 from selenium.webdriver import Chrome, ChromeService
@@ -7,6 +8,7 @@ from selenium.webdriver.chrome.options import Options
 
 WSL_INSIDE = os.getenv("WSL_INSIDE", False)
 CHROME_BINARY = os.getenv("CHROME_BINARY", "")
+RUNNING_ON_LINUX = platform.system().lower() == "linux"
 
 __driver__ = None
 __driver_download_dir__ = None
@@ -56,9 +58,10 @@ def setup_driver(driver_path=None, profile_dir=None, headless=True, download_dir
     if profile_dir:
         chrome_options.add_argument(f"--user-data-dir={profile_dir}")
     if headless:
-        if WSL_INSIDE:
+        if WSL_INSIDE or RUNNING_ON_LINUX:
             chrome_options.add_argument("--headless=new")
             chrome_options.add_argument("--no-sandbox")
+            chrome_options.add_argument("--disable-dev-shm-usage")
         else:
             chrome_options.add_argument("--headless")
 
@@ -72,6 +75,9 @@ def setup_driver(driver_path=None, profile_dir=None, headless=True, download_dir
     chrome_options.add_experimental_option("prefs", prefs)
     chrome_options.add_argument("--disable-gpu")
     chrome_options.add_argument("--window-size=1920,1080")
+    chrome_options.set_capability(
+        "goog:loggingPrefs", {"browser": "ALL", "performance": "ALL"}
+    )
 
     resolved_download_dir = str(
         Path(download_dir or os.path.join(os.getcwd(), "gp_temp")).resolve()

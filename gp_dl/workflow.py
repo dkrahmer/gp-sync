@@ -143,11 +143,17 @@ def download_albums(
     temp_dir = temp_dir or output_dir
     temp_dir_path = Path(temp_dir).resolve()
     output_path = Path(output_dir).resolve()
+
+    # Create dedicated downloads subdirectory
+    downloads_dir = temp_dir_path / ".downloads"
+    downloads_dir.mkdir(parents=True, exist_ok=True)
+    logging.info(f"Using downloads subdirectory: {downloads_dir}")
+
     driver = get_driver(
         driver_path=driver_path,
         profile_dir=profile_dir,
         headless=headless,
-        temp_dir=str(temp_dir_path),
+        temp_dir=str(downloads_dir),
     )
 
     if not os.path.exists(output_dir) or not os.path.isdir(output_dir):
@@ -186,12 +192,12 @@ def download_albums(
                 driver,
                 album_title,
                 output_path,
-                temp_dir_path,
+                downloads_dir,
                 propagate_deletes,
             )
         except Exception as e:
             logging.error(
-                f"Individual sync failed for {album_title}; ZIP fallback is disabled. Error: {e}"
+                f"Individual sync failed for {album_title}. Error: {e}"
             )
             failed_albums.append(album_title)
             duration = time.perf_counter() - album_start
@@ -219,7 +225,7 @@ def download_albums(
 
         if not handled:
             logging.error(
-                f"Could not collect item links for {album_title}; ZIP fallback is disabled."
+                f"Could not collect item links for {album_title}."
             )
             failed_albums.append(album_title)
             duration = time.perf_counter() - album_start
